@@ -95,7 +95,7 @@ from mcp.client.stdio import stdio_client
 from mcp.types import Tool
 
 from xcore.services import BaseService, ServiceStatus
-from catalog import SUB_AGENT_ROLES, mcp_tools_for_agent, sub_agents_for
+from .catalog import SUB_AGENT_ROLES, mcp_tools_for_agent, sub_agents_for
 
 logger = logging.getLogger("ext.mcp_bridge")
 
