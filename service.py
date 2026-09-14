@@ -28,6 +28,7 @@ Configuration dans integration.yaml :
 from __future__ import annotations
 
 import asyncio
+import re
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -165,33 +166,62 @@ class McpBridgeService(BaseService):
         directement concaténable à TOOLS_SCHEMA."""
         return self._tools_schema
 
-    def _namespaced_arguments(self, server_name: str, tenant_id: str | None, arguments: dict) -> dict:
+    _UNSAFE_PATH_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+    @staticmethod
+    def _is_unsafe_path(value: str) -> bool:
+        """Vrai si la valeur ne ressemble pas à un simple nom de fichier :
+        chemin absolu, URL/schéma, séparateur de dossier ou segment `..`.
+        Les outils document MCP ne manipulent que des noms de fichiers nus
+        (cohérent avec _save_generated_document côté chat, qui refuse déjà
+        tout ce qui contient `/`) — tout le reste est une tentative
+        d'évasion du dossier tenant, jamais un usage légitime."""
+        if value.startswith(("/", "\\")):
+            return True
+        if McpBridgeService._UNSAFE_PATH_RE.match(value):
+            return True
+        if "/" in value or "\\" in value or ".." in value:
+            return True
+        return False
+
+    def _namespaced_arguments(
+        self, server_name: str, tenant_id: str | None, arguments: dict
+    ) -> tuple[dict, list[str]]:
         """Réécrit les paramètres de type chemin vers un sous-dossier propre
         au tenant (`<tenant_id>/<valeur>`), pour qu'un « rapport.docx » créé
         par un tenant n'écrase ni ne soit visible pour un autre — y compris
         via un outil de listing (list_available_documents et équivalents),
-        qui énumère un répertoire entier, pas juste des noms de fichiers."""
+        qui énumère un répertoire entier, pas juste des noms de fichiers.
+
+        Retourne (arguments_réécrits, params_rejetés) : une valeur de chemin
+        dangereuse (absolu, URL, `..`, sous-dossier) est REJETÉE — elle
+        n'est ni namespacée ni transmise au serveur MCP (l'ancien code la
+        laissait passer telle quelle via `continue`, soit une traversée de
+        répertoire exploitable dès qu'un serveur ne valide pas lui-même)."""
         if not tenant_id:
-            return arguments
+            return arguments, []
         param_names = self._path_params.get(server_name, [])
         if not param_names:
-            return arguments
+            return arguments, []
 
         base_cwd = self._cwd_by_server.get(server_name)
         if base_cwd is not None:
             (base_cwd / tenant_id).mkdir(parents=True, exist_ok=True)
 
         namespaced = dict(arguments)
+        rejected: list[str] = []
         for param in param_names:
             raw = namespaced.get(param)
             if not isinstance(raw, str) or not raw:
                 continue
-            if raw.startswith(("/", "http://", "https://")) or ".." in raw:
-                continue  # chemin absolu, URL, ou tentative de traversée : ne pas toucher
+            if self._is_unsafe_path(raw):
+                rejected.append(param)
+                namespaced.pop(param, None)
+                continue
             if raw.startswith(f"{tenant_id}/"):
                 continue  # déjà namespacé (ex: relu depuis un appel précédent)
             namespaced[param] = f"{tenant_id}/{raw}"
-        return namespaced
+        return namespaced, rejected
 
     async def call_tool(self, prefixed_name: str, arguments: dict, tenant_id: str | None = None) -> str:
         # server_name reste valide même si le nom vient d'un outil dont le
@@ -203,7 +233,17 @@ class McpBridgeService(BaseService):
             return f"Outil MCP inconnu ou non exposé : {prefixed_name}"
 
         original_name = prefixed_name[len(f"mcp_{server_name}_"):]
-        call_args = self._namespaced_arguments(server_name, tenant_id, arguments)
+        call_args, rejected = self._namespaced_arguments(server_name, tenant_id, arguments)
+        if rejected:
+            logger.warning(
+                "appel MCP '%s' bloqué : paramètre(s) de chemin dangereux (%s) — traversée de répertoire interdite.",
+                prefixed_name,
+                ", ".join(rejected),
+            )
+            return (
+                f"Paramètre(s) invalide(s) ({', '.join(rejected)}) : seul un simple "
+                "nom de fichier est accepté, sans dossier, sans `..`, sans chemin absolu."
+            )
 
         if server_name not in self._sessions:
             if not await self._ensure_connected(server_name):
