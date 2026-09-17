@@ -191,12 +191,25 @@ class McpBridgeService(BaseService):
         params = StdioServerParameters(
             command=cfg["command"],
             args=cfg.get("args", []),
-            env=cfg.get("env"),
+            env=self.server_env(cfg),
             cwd=cfg.get("cwd"),
         )
         handle = await self._connect(name, params, self._stack)
         self._servers[name] = handle
         logger.info("ext.mcp_bridge : '%s' prêt — %d tool(s).", name, len(handle.tools))
+
+    @staticmethod
+    def server_env(cfg: dict[str, Any]) -> dict[str, str] | None:
+        """Environnement du sous-processus. xcore remplace un `${VAR}` absent par
+        une chaîne vide (sans valeur par défaut possible) : une valeur vide est
+        donc retirée, puis `env_defaults` complète ce qui manque. Ainsi
+        `DONATA_TRANSPORT: ${DONATA_TRANSPORT}` + `env_defaults: {DONATA_TRANSPORT: memory}`
+        vaut « la variable si elle est définie, sinon memory »."""
+        env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items() if v not in (None, "")}
+        for key, value in (cfg.get("env_defaults") or {}).items():
+            if value not in (None, ""):
+                env.setdefault(str(key), str(value))
+        return env or None
 
     @staticmethod
     async def _connect(name: str, params: StdioServerParameters, stack: AsyncExitStack) -> _ServerHandle:
@@ -249,7 +262,7 @@ class McpBridgeService(BaseService):
         cwd = cfg.get("cwd")
         if cwd is not None:
             cwd = cwd.format(root=root)
-        params = StdioServerParameters(command=cfg["command"], args=args, env=cfg.get("env"), cwd=cwd)
+        params = StdioServerParameters(command=cfg["command"], args=args, env=self.server_env(cfg), cwd=cwd)
 
         stack = AsyncExitStack()
         try:
