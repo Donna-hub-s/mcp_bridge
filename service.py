@@ -84,7 +84,9 @@ aucun tool `mcp_*` : il délègue (voir plugin chat).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 from collections.abc import Iterable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -98,6 +100,17 @@ from xcore.services import BaseService, ServiceStatus
 from .catalog import SUB_AGENT_ROLES, mcp_tools_for_agent, sub_agents_for
 
 logger = logging.getLogger("ext.mcp_bridge")
+
+# Contrainte des providers (OpenAI, Anthropic, Groq...) sur les noms
+# d'outils : ^[a-zA-Z0-9_-]{1,64}$. Un serveur scopé `filesystem:<uuid>`
+# produisait `mcp_filesystem:<uuid>_read_file` — `:` interdit et > 64
+# caractères, rejeté en 400 par les providers cloud.
+_TOOL_NAME_MAX = 64
+_TOOL_NAME_INVALID = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _short_hash(value: str, length: int = 10) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
 
 
 @dataclass
@@ -124,6 +137,13 @@ class McpBridgeService(BaseService):
         # tous ensemble à `shutdown()`), chacun doit pouvoir être fermé
         # individuellement (`close_scoped_server`) sans affecter les autres.
         self._scoped_stacks: dict[str, AsyncExitStack] = {}
+        # Nom exposé au LLM → (serveur, tool natif). Rempli à chaque
+        # génération de schéma : c'est la seule façon fiable de retrouver
+        # un tool dont le nom a été normalisé (serveur scopé, nom trop long).
+        self._tool_index: dict[str, tuple[str, str]] = {}
+        # Borne d'un appel de tool : sans elle, un serveur MCP bloqué fige la
+        # boucle agentique (et le flux SSE) indéfiniment.
+        self._call_timeout = float(self._config.get("call_timeout_seconds", 120))
 
     async def init(self) -> None:
         self._status = ServiceStatus.INITIALIZING
@@ -310,7 +330,14 @@ class McpBridgeService(BaseService):
         jamais de valeur inventée en silence."""
 
         handle = self._server(server)
-        result = await handle.session.call_tool(tool_name, arguments or {})
+        try:
+            result = await asyncio.wait_for(
+                handle.session.call_tool(tool_name, arguments or {}), timeout=self._call_timeout
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"ext.mcp_bridge : '{server}.{tool_name}' sans réponse après {self._call_timeout:.0f}s."
+            ) from exc
         if result.is_error:
             raise RuntimeError(f"ext.mcp_bridge : '{server}.{tool_name}' a renvoyé une erreur : {result.content}")
         return result.content
@@ -406,17 +433,37 @@ class McpBridgeService(BaseService):
             for role in sub_agents_for(agent)
         ]
 
-    @staticmethod
-    def _to_openai_schema(tool: Tool, prefix: str | None = None) -> dict[str, Any]:
+    def _public_tool_name(self, server: str, tool_name: str) -> str:
+        """Nom `mcp_<serveur>_<tool>` conforme aux contraintes providers
+        (^[a-zA-Z0-9_-]{1,64}$). Un serveur scopé `category:key` devient
+        `category_<hash(key)>` — la clé (souvent un uuid de tenant) ne fuit
+        pas dans le prompt et le `:` disparaît. Au-delà de 64 caractères,
+        le nom du tool est remplacé par un hash stable."""
+        if self._is_scoped(server):
+            category, _, key = server.partition(":")
+            prefix = f"{category}_{_short_hash(key)}"
+        else:
+            prefix = server
+        prefix = _TOOL_NAME_INVALID.sub("_", prefix)
+        name = f"mcp_{prefix}_{_TOOL_NAME_INVALID.sub('_', tool_name)}"
+        if len(name) > _TOOL_NAME_MAX:
+            name = f"mcp_{prefix}_{_short_hash(tool_name, 12)}"[:_TOOL_NAME_MAX]
+        return name
+
+    def _to_openai_schema(self, tool: Tool, prefix: str | None = None) -> dict[str, Any]:
         """Convertit un tool MCP (SDK mcp) en schéma OpenAI function-calling
         (le format attendu par les providers LLM dans tools=[...]).
 
         `prefix=None` garde le nom brut du tool (usage LangChain) ;
-        sinon chaque tool est nommé `mcp_<prefix>_<nom>` — le format
-        attendu par le plugin chat (_execute_tool_call_raw), qui permet
-        à `call_tool_named()` de retrouver le serveur d'origine."""
+        sinon `prefix` est le nom du serveur et le tool reçoit un nom public
+        (`_public_tool_name`), indexé pour que `call_tool_named()` retrouve
+        le serveur et le tool natif d'origine."""
         schema = getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None) or {}
-        name = f"mcp_{prefix}_{tool.name}" if prefix else tool.name
+        if prefix:
+            name = self._public_tool_name(prefix, tool.name)
+            self._tool_index[name] = (prefix, tool.name)
+        else:
+            name = tool.name
         return {
             "type": "function",
             "function": {
@@ -445,21 +492,41 @@ class McpBridgeService(BaseService):
         `mcp_<serveur>_<tool>` — le format renvoyé par
         `list_tools_schema()` / `list_tools_schema_for_agent()` /
         `list_tools_schema_for_scoped()`, et attendu par le plugin chat /
-        les boucles de sous-agents. Lève si le préfixe ou le tool est
-        inconnu.
+        les boucles de sous-agents. Lève KeyError si le nom est inconnu
+        (voir `resolve_tool_name`), PermissionError si un serveur scopé
+        est appelé depuis un autre tenant que celui de sa clé."""
 
-        Résolution par plus long préfixe de serveur connu : un serveur
-        scopé porte un nom `category:<key>` dont la clé peut contenir
-        des `_` (`filesystem:client-x:mission_2026`) — un découpage
-        naïf sur `_` casserait le nom du tool juste avant le tool lui-même."""
+        server, tool_name, scoped = self.resolve_tool_name(name)
+        if scoped and tenant_id is not None:
+            # Un serveur scopé porte la clé de son propriétaire
+            # (`filesystem:<tenant_id>`) : jamais appelable depuis un autre
+            # tenant, même si le modèle devine ou recopie son nom.
+            _, _, key = server.partition(":")
+            if key != tenant_id:
+                raise PermissionError(
+                    f"ext.mcp_bridge : serveur scopé '{server}' refusé pour ce tenant."
+                )
+        return await self.call_tool(server, tool_name, arguments)
 
+    def resolve_tool_name(self, name: str) -> tuple[str, str, bool]:
+        """(serveur, tool natif, scopé ?) d'un nom public `mcp_*`. Lève
+        KeyError si le nom est inconnu ou si son serveur n'est plus connecté.
+
+        Index d'abord (noms générés par les schémas) ; sinon repli par plus
+        long préfixe, limité aux serveurs STATIQUES — un serveur scopé n'est
+        joignable que via un nom réellement présenté au modèle."""
         if not name.startswith("mcp_"):
-            raise ValueError(f"ext.mcp_bridge : nom d'outil attendu sous 'mcp_<serveur>_<tool>', reçu '{name}'.")
+            raise KeyError(f"ext.mcp_bridge : nom d'outil attendu sous 'mcp_<serveur>_<tool>', reçu '{name}'.")
+        indexed = self._tool_index.get(name)
+        if indexed is not None and indexed[0] in self._servers:
+            server, tool_name = indexed
+            return server, tool_name, self._is_scoped(server)
+
         rest = name[len("mcp_"):]
-        server = max(self._servers, key=lambda s: len(s) if rest.startswith(s + "_") else -1)
-        if rest.startswith(f"{server}_"):
-            tool_name = rest[len(server) + 1:]
-            return await self.call_tool(server, tool_name, arguments)
+        static = [s for s in self._servers if not self._is_scoped(s) and rest.startswith(s + "_")]
+        if static:
+            server = max(static, key=len)
+            return server, rest[len(server) + 1:], False
         raise KeyError(
             f"ext.mcp_bridge : serveur inconnu pour '{name}' "
             f"(connectés : {', '.join(self._servers) or 'aucun'})."
