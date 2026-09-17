@@ -47,10 +47,6 @@ Config (integration.yaml) :
                 args: ["filesystem-mcp", "{root}"]
                 # `cwd` d'un gabarit dynamique peut aussi contenir `{root}`
                 # — substitué de la même façon que dans `args`.
-            # Éviction périodique des serveurs scopés inactifs (optionnel,
-            # défauts ci-dessous) — voir _reap_idle_scoped.
-            scoped_idle_ttl_seconds: 1800
-            scoped_reap_interval_seconds: 300
 
 `servers` (ci-dessus) démarre un sous-processus par entrée, une fois pour
 toutes, à `init()` — pour un serveur dont la portée est la même pour toute
@@ -114,6 +110,16 @@ _TOOL_NAME_MAX = 64
 _TOOL_NAME_INVALID = re.compile(r"[^a-zA-Z0-9_-]")
 
 
+def _is_broken_session(exc: BaseException) -> bool:
+    """Session MCP inutilisable (processus arrêté, flux fermé) — distincte d'une
+    erreur métier renvoyée par l'outil, qui ne justifie jamais une relance."""
+    import anyio
+
+    if isinstance(exc, (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream, BrokenPipeError, ConnectionError)):
+        return True
+    return "connection closed" in str(exc).lower()
+
+
 def _short_hash(value: str, length: int = 10) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
 
@@ -123,11 +129,6 @@ class _ServerHandle:
     name: str
     session: ClientSession
     tools: list[Tool] = field(default_factory=list)
-    # Horloge monotone — posée à l'ouverture, rafraîchie à chaque call_tool.
-    # Sert uniquement le reaper des serveurs SCOPÉS (voir _reap_idle_scoped) ;
-    # sans objet pour les serveurs statiques, qui vivent toute la durée de
-    # l'app et ne sont jamais évincés.
-    last_used: float = field(default_factory=time.monotonic)
 
 
 class McpBridgeService(BaseService):
@@ -154,57 +155,28 @@ class McpBridgeService(BaseService):
         # Borne d'un appel de tool : sans elle, un serveur MCP bloqué fige la
         # boucle agentique (et le flux SSE) indéfiniment.
         self._call_timeout = float(self._config.get("call_timeout_seconds", 120))
-        # Reaper des serveurs scopés (filesystem par mission) — sans lui, ils
-        # s'accumulent jusqu'à l'arrêt de l'app (voir docstring de
-        # close_all_scoped_servers). Une mission normale dure quelques
-        # minutes ; 30 min d'inactivité est déjà large pour couvrir une
-        # pause utilisateur sans relancer le sous-processus inutilement.
-        self._scoped_idle_ttl_s = float(self._config.get("scoped_idle_ttl_seconds", 1800))
-        self._reap_interval_s = float(self._config.get("scoped_reap_interval_seconds", 300))
-        self._reap_task: asyncio.Task | None = None
+        # Pile de contexte PAR serveur statique : un serveur tombé (processus
+        # arrêté, flux coupé) se relance seul, sans toucher aux autres.
+        self._server_stacks: dict[str, AsyncExitStack] = {}
+        self._restart_locks: dict[str, asyncio.Lock] = {}
+        # Serveurs scopés inactifs fermés après ce délai (0 = jamais).
+        self._scoped_idle_seconds = float(self._config.get("scoped_idle_seconds", 900))
+        self._scoped_last_used: dict[str, float] = {}
+        self._in_flight: dict[str, int] = {}
+        self._reaper: asyncio.Task | None = None
 
     async def init(self) -> None:
         self._status = ServiceStatus.INITIALIZING
         for name, cfg in self._servers_cfg.items():
             await self._start_server_with_retry(name, cfg)
         self._status = ServiceStatus.READY if self._servers else ServiceStatus.DEGRADED
+        if self._scoped_idle_seconds > 0:
+            self._reaper = asyncio.create_task(self._reap_forever())
         logger.info(
             "ext.mcp_bridge prêt — serveur(s) connecté(s) : %s / %d configuré(s)",
             ", ".join(self._servers) or "aucun",
             len(self._servers_cfg),
         )
-        if self._dynamic_cfg:
-            self._reap_task = asyncio.create_task(self._reap_loop())
-
-    async def _reap_loop(self) -> None:
-        """Ferme périodiquement les serveurs scopés inactifs depuis plus de
-        `scoped_idle_ttl_seconds` — filet de sécurité pour les appelants qui
-        oublient `close_scoped_server` (ex. mission interrompue avant son
-        nœud terminal). Tâche de fond, annulée proprement à shutdown()."""
-        try:
-            while True:
-                await asyncio.sleep(self._reap_interval_s)
-                await self._reap_idle_scoped()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("ext.mcp_bridge : boucle de nettoyage des serveurs scopés interrompue")
-
-    async def _reap_idle_scoped(self) -> None:
-        now = time.monotonic()
-        idle = [
-            name
-            for name in list(self._scoped_stacks)
-            if (handle := self._servers.get(name)) is not None
-            and now - handle.last_used >= self._scoped_idle_ttl_s
-        ]
-        for name in idle:
-            category, _, key = name.partition(":")
-            logger.info(
-                "ext.mcp_bridge : fermeture du serveur scopé '%s' inactif depuis %.0fs.",
-                name, now - self._servers[name].last_used,
-            )
-            await self.close_scoped_server(category, key)
 
     async def _start_server_with_retry(
         self, name: str, cfg: dict[str, Any], *, attempts: int = 2, delay: float = 1.0
@@ -241,12 +213,84 @@ class McpBridgeService(BaseService):
         params = StdioServerParameters(
             command=cfg["command"],
             args=cfg.get("args", []),
-            env=cfg.get("env"),
+            env=self.server_env(cfg),
             cwd=cfg.get("cwd"),
         )
-        handle = await self._connect(name, params, self._stack)
+        stack = AsyncExitStack()
+        try:
+            handle = await self._connect(name, params, stack)
+        except BaseException:
+            await stack.aclose()
+            raise
+        self._server_stacks[name] = stack
         self._servers[name] = handle
         logger.info("ext.mcp_bridge : '%s' prêt — %d tool(s).", name, len(handle.tools))
+
+    async def _restart_server(self, name: str) -> bool:
+        """Relance un serveur statique dont la session est morte. Un seul
+        redémarrage à la fois par serveur ; False si la relance échoue."""
+        if name not in self._servers_cfg:
+            return False
+        lock = self._restart_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            old = self._server_stacks.pop(name, None)
+            self._servers.pop(name, None)
+            if old is not None:
+                try:
+                    await old.aclose()
+                except BaseException as exc:  # flux déjà rompu : fermeture best-effort
+                    logger.debug("ext.mcp_bridge : fermeture de '%s' : %r", name, exc)
+            try:
+                await self._start_server(name, self._servers_cfg[name])
+            except Exception:
+                logger.exception("ext.mcp_bridge : relance de '%s' échouée", name)
+                return False
+        logger.warning("ext.mcp_bridge : '%s' relancé après une coupure", name)
+        return True
+
+    async def _reap_forever(self) -> None:
+        interval = max(30.0, min(self._scoped_idle_seconds / 3, 300.0))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.reap_idle_scoped_servers()
+            except Exception:
+                logger.exception("ext.mcp_bridge : nettoyage des serveurs scopés échoué")
+
+    async def reap_idle_scoped_servers(self, now: float | None = None) -> list[str]:
+        """Ferme les serveurs scopés inutilisés depuis `scoped_idle_seconds`
+        (jamais un serveur en cours d'appel). Réouverts à la demande ensuite."""
+        now = time.monotonic() if now is None else now
+        closed = []
+        for name in list(self._scoped_stacks):
+            if self._in_flight.get(name):
+                continue
+            if now - self._scoped_last_used.get(name, now) < self._scoped_idle_seconds:
+                continue
+            self._servers.pop(name, None)
+            self._scoped_last_used.pop(name, None)
+            stack = self._scoped_stacks.pop(name)
+            try:
+                await stack.aclose()
+            except BaseException as exc:
+                logger.debug("ext.mcp_bridge : fermeture de '%s' : %r", name, exc)
+            closed.append(name)
+        if closed:
+            logger.info("ext.mcp_bridge : %d serveur(s) scopé(s) inactif(s) fermé(s)", len(closed))
+        return closed
+
+    @staticmethod
+    def server_env(cfg: dict[str, Any]) -> dict[str, str] | None:
+        """Environnement du sous-processus. xcore remplace un `${VAR}` absent par
+        une chaîne vide (sans valeur par défaut possible) : une valeur vide est
+        donc retirée, puis `env_defaults` complète ce qui manque. Ainsi
+        `DONATA_TRANSPORT: ${DONATA_TRANSPORT}` + `env_defaults: {DONATA_TRANSPORT: memory}`
+        vaut « la variable si elle est définie, sinon memory »."""
+        env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items() if v not in (None, "")}
+        for key, value in (cfg.get("env_defaults") or {}).items():
+            if value not in (None, ""):
+                env.setdefault(str(key), str(value))
+        return env or None
 
     @staticmethod
     async def _connect(name: str, params: StdioServerParameters, stack: AsyncExitStack) -> _ServerHandle:
@@ -286,6 +330,7 @@ class McpBridgeService(BaseService):
 
         name = self.scoped_server_name(category, key)
         if name in self._servers:
+            self._scoped_last_used[name] = time.monotonic()
             return name
         if category not in self._dynamic_cfg:
             raise ValueError(
@@ -299,7 +344,7 @@ class McpBridgeService(BaseService):
         cwd = cfg.get("cwd")
         if cwd is not None:
             cwd = cwd.format(root=root)
-        params = StdioServerParameters(command=cfg["command"], args=args, env=cfg.get("env"), cwd=cwd)
+        params = StdioServerParameters(command=cfg["command"], args=args, env=self.server_env(cfg), cwd=cwd)
 
         stack = AsyncExitStack()
         try:
@@ -309,6 +354,7 @@ class McpBridgeService(BaseService):
             raise
         self._servers[name] = handle
         self._scoped_stacks[name] = stack
+        self._scoped_last_used[name] = time.monotonic()
         logger.info(
             "ext.mcp_bridge : serveur scopé '%s' prêt (root=%s) — %d tool(s).", name, root, len(handle.tools)
         )
@@ -322,16 +368,19 @@ class McpBridgeService(BaseService):
 
         name = self.scoped_server_name(category, key)
         self._servers.pop(name, None)
+        self._scoped_last_used.pop(name, None)
         stack = self._scoped_stacks.pop(name, None)
         if stack is not None:
             await stack.aclose()
 
     async def close_all_scoped_servers(self) -> None:
-        """Filet de sécurité — ferme TOUT serveur scopé encore ouvert, quelle
-        que soit son activité récente. Appelé par `shutdown()` (arrêt de
-        l'app). Pour l'éviction périodique par inactivité pendant que l'app
-        tourne, voir `_reap_idle_scoped` (boucle `_reap_task`, démarrée dans
-        `init()` si `dynamic_servers` est configuré)."""
+        """Filet de sécurité — ferme tout serveur scopé encore ouvert
+        (ex. une mission jamais arrivée à un nœud terminal). Appelé par
+        `shutdown()` ; peut aussi être appelé séparément par un futur
+        "reaper" périodique — non construit ici, voir le docstring du
+        module pour cette limite connue (les serveurs scopés
+        s'accumulent jusqu'à l'arrêt de l'app tant qu'aucun appelant
+        n'appelle `close_scoped_server` explicitement)."""
 
         for name in list(self._scoped_stacks):
             self._servers.pop(name, None)
@@ -339,14 +388,14 @@ class McpBridgeService(BaseService):
             await stack.aclose()
 
     async def shutdown(self) -> None:
-        if self._reap_task is not None:
-            self._reap_task.cancel()
-            try:
-                await self._reap_task
-            except asyncio.CancelledError:
-                pass
-            self._reap_task = None
+        if self._reaper is not None:
+            self._reaper.cancel()
         await self.close_all_scoped_servers()
+        for name in list(self._server_stacks):
+            try:
+                await self._server_stacks.pop(name).aclose()
+            except BaseException as exc:
+                logger.debug("ext.mcp_bridge : fermeture de '%s' : %r", name, exc)
         await self._stack.aclose()
         self._servers.clear()
         self._status = ServiceStatus.STOPPED
@@ -384,19 +433,37 @@ class McpBridgeService(BaseService):
         inconnu ou si le serveur MCP renvoie une erreur (`is_error`) —
         jamais de valeur inventée en silence."""
 
-        handle = self._server(server)
-        handle.last_used = time.monotonic()
+        self._in_flight[server] = self._in_flight.get(server, 0) + 1
         try:
-            result = await asyncio.wait_for(
-                handle.session.call_tool(tool_name, arguments or {}), timeout=self._call_timeout
-            )
+            result = await self._call_once_with_restart(server, tool_name, arguments or {})
+        finally:
+            self._in_flight[server] -= 1
+            if server in self._scoped_last_used:
+                self._scoped_last_used[server] = time.monotonic()
+        if result.is_error:
+            raise RuntimeError(f"ext.mcp_bridge : '{server}.{tool_name}' a renvoyé une erreur : {result.content}")
+        return result.content
+
+    async def _call_once_with_restart(self, server: str, tool_name: str, arguments: dict[str, Any]) -> Any:
+        """Appel borné par le timeout. Si la session d'un serveur STATIQUE est
+        rompue (processus mort, flux fermé), une relance puis un seul nouvel essai."""
+        handle = self._server(server)
+        try:
+            return await asyncio.wait_for(handle.session.call_tool(tool_name, arguments), timeout=self._call_timeout)
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"ext.mcp_bridge : '{server}.{tool_name}' sans réponse après {self._call_timeout:.0f}s."
             ) from exc
-        if result.is_error:
-            raise RuntimeError(f"ext.mcp_bridge : '{server}.{tool_name}' a renvoyé une erreur : {result.content}")
-        return result.content
+        except Exception as exc:
+            if not _is_broken_session(exc) or not await self._restart_server(server):
+                raise
+        handle = self._server(server)
+        try:
+            return await asyncio.wait_for(handle.session.call_tool(tool_name, arguments), timeout=self._call_timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"ext.mcp_bridge : '{server}.{tool_name}' sans réponse après {self._call_timeout:.0f}s."
+            ) from exc
 
     def list_tools_schema(self) -> list[dict[str, Any]]:
         """Schémas OpenAI-format des tools des serveurs STATIQUES
