@@ -47,6 +47,10 @@ Config (integration.yaml) :
                 args: ["filesystem-mcp", "{root}"]
                 # `cwd` d'un gabarit dynamique peut aussi contenir `{root}`
                 # — substitué de la même façon que dans `args`.
+            # Éviction périodique des serveurs scopés inactifs (optionnel,
+            # défauts ci-dessous) — voir _reap_idle_scoped.
+            scoped_idle_ttl_seconds: 1800
+            scoped_reap_interval_seconds: 300
 
 `servers` (ci-dessus) démarre un sous-processus par entrée, une fois pour
 toutes, à `init()` — pour un serveur dont la portée est la même pour toute
@@ -87,6 +91,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import time
 from collections.abc import Iterable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -118,6 +123,11 @@ class _ServerHandle:
     name: str
     session: ClientSession
     tools: list[Tool] = field(default_factory=list)
+    # Horloge monotone — posée à l'ouverture, rafraîchie à chaque call_tool.
+    # Sert uniquement le reaper des serveurs SCOPÉS (voir _reap_idle_scoped) ;
+    # sans objet pour les serveurs statiques, qui vivent toute la durée de
+    # l'app et ne sont jamais évincés.
+    last_used: float = field(default_factory=time.monotonic)
 
 
 class McpBridgeService(BaseService):
@@ -144,6 +154,14 @@ class McpBridgeService(BaseService):
         # Borne d'un appel de tool : sans elle, un serveur MCP bloqué fige la
         # boucle agentique (et le flux SSE) indéfiniment.
         self._call_timeout = float(self._config.get("call_timeout_seconds", 120))
+        # Reaper des serveurs scopés (filesystem par mission) — sans lui, ils
+        # s'accumulent jusqu'à l'arrêt de l'app (voir docstring de
+        # close_all_scoped_servers). Une mission normale dure quelques
+        # minutes ; 30 min d'inactivité est déjà large pour couvrir une
+        # pause utilisateur sans relancer le sous-processus inutilement.
+        self._scoped_idle_ttl_s = float(self._config.get("scoped_idle_ttl_seconds", 1800))
+        self._reap_interval_s = float(self._config.get("scoped_reap_interval_seconds", 300))
+        self._reap_task: asyncio.Task | None = None
 
     async def init(self) -> None:
         self._status = ServiceStatus.INITIALIZING
@@ -155,6 +173,38 @@ class McpBridgeService(BaseService):
             ", ".join(self._servers) or "aucun",
             len(self._servers_cfg),
         )
+        if self._dynamic_cfg:
+            self._reap_task = asyncio.create_task(self._reap_loop())
+
+    async def _reap_loop(self) -> None:
+        """Ferme périodiquement les serveurs scopés inactifs depuis plus de
+        `scoped_idle_ttl_seconds` — filet de sécurité pour les appelants qui
+        oublient `close_scoped_server` (ex. mission interrompue avant son
+        nœud terminal). Tâche de fond, annulée proprement à shutdown()."""
+        try:
+            while True:
+                await asyncio.sleep(self._reap_interval_s)
+                await self._reap_idle_scoped()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("ext.mcp_bridge : boucle de nettoyage des serveurs scopés interrompue")
+
+    async def _reap_idle_scoped(self) -> None:
+        now = time.monotonic()
+        idle = [
+            name
+            for name in list(self._scoped_stacks)
+            if (handle := self._servers.get(name)) is not None
+            and now - handle.last_used >= self._scoped_idle_ttl_s
+        ]
+        for name in idle:
+            category, _, key = name.partition(":")
+            logger.info(
+                "ext.mcp_bridge : fermeture du serveur scopé '%s' inactif depuis %.0fs.",
+                name, now - self._servers[name].last_used,
+            )
+            await self.close_scoped_server(category, key)
 
     async def _start_server_with_retry(
         self, name: str, cfg: dict[str, Any], *, attempts: int = 2, delay: float = 1.0
@@ -277,13 +327,11 @@ class McpBridgeService(BaseService):
             await stack.aclose()
 
     async def close_all_scoped_servers(self) -> None:
-        """Filet de sécurité — ferme tout serveur scopé encore ouvert
-        (ex. une mission jamais arrivée à un nœud terminal). Appelé par
-        `shutdown()` ; peut aussi être appelé séparément par un futur
-        "reaper" périodique — non construit ici, voir le docstring du
-        module pour cette limite connue (les serveurs scopés
-        s'accumulent jusqu'à l'arrêt de l'app tant qu'aucun appelant
-        n'appelle `close_scoped_server` explicitement)."""
+        """Filet de sécurité — ferme TOUT serveur scopé encore ouvert, quelle
+        que soit son activité récente. Appelé par `shutdown()` (arrêt de
+        l'app). Pour l'éviction périodique par inactivité pendant que l'app
+        tourne, voir `_reap_idle_scoped` (boucle `_reap_task`, démarrée dans
+        `init()` si `dynamic_servers` est configuré)."""
 
         for name in list(self._scoped_stacks):
             self._servers.pop(name, None)
@@ -291,6 +339,13 @@ class McpBridgeService(BaseService):
             await stack.aclose()
 
     async def shutdown(self) -> None:
+        if self._reap_task is not None:
+            self._reap_task.cancel()
+            try:
+                await self._reap_task
+            except asyncio.CancelledError:
+                pass
+            self._reap_task = None
         await self.close_all_scoped_servers()
         await self._stack.aclose()
         self._servers.clear()
@@ -330,6 +385,7 @@ class McpBridgeService(BaseService):
         jamais de valeur inventée en silence."""
 
         handle = self._server(server)
+        handle.last_used = time.monotonic()
         try:
             result = await asyncio.wait_for(
                 handle.session.call_tool(tool_name, arguments or {}), timeout=self._call_timeout
