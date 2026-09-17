@@ -87,6 +87,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import time
 from collections.abc import Iterable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -107,6 +108,16 @@ logger = logging.getLogger("ext.mcp_bridge")
 # caractères, rejeté en 400 par les providers cloud.
 _TOOL_NAME_MAX = 64
 _TOOL_NAME_INVALID = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _is_broken_session(exc: BaseException) -> bool:
+    """Session MCP inutilisable (processus arrêté, flux fermé) — distincte d'une
+    erreur métier renvoyée par l'outil, qui ne justifie jamais une relance."""
+    import anyio
+
+    if isinstance(exc, (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream, BrokenPipeError, ConnectionError)):
+        return True
+    return "connection closed" in str(exc).lower()
 
 
 def _short_hash(value: str, length: int = 10) -> str:
@@ -144,12 +155,23 @@ class McpBridgeService(BaseService):
         # Borne d'un appel de tool : sans elle, un serveur MCP bloqué fige la
         # boucle agentique (et le flux SSE) indéfiniment.
         self._call_timeout = float(self._config.get("call_timeout_seconds", 120))
+        # Pile de contexte PAR serveur statique : un serveur tombé (processus
+        # arrêté, flux coupé) se relance seul, sans toucher aux autres.
+        self._server_stacks: dict[str, AsyncExitStack] = {}
+        self._restart_locks: dict[str, asyncio.Lock] = {}
+        # Serveurs scopés inactifs fermés après ce délai (0 = jamais).
+        self._scoped_idle_seconds = float(self._config.get("scoped_idle_seconds", 900))
+        self._scoped_last_used: dict[str, float] = {}
+        self._in_flight: dict[str, int] = {}
+        self._reaper: asyncio.Task | None = None
 
     async def init(self) -> None:
         self._status = ServiceStatus.INITIALIZING
         for name, cfg in self._servers_cfg.items():
             await self._start_server_with_retry(name, cfg)
         self._status = ServiceStatus.READY if self._servers else ServiceStatus.DEGRADED
+        if self._scoped_idle_seconds > 0:
+            self._reaper = asyncio.create_task(self._reap_forever())
         logger.info(
             "ext.mcp_bridge prêt — serveur(s) connecté(s) : %s / %d configuré(s)",
             ", ".join(self._servers) or "aucun",
@@ -194,9 +216,68 @@ class McpBridgeService(BaseService):
             env=self.server_env(cfg),
             cwd=cfg.get("cwd"),
         )
-        handle = await self._connect(name, params, self._stack)
+        stack = AsyncExitStack()
+        try:
+            handle = await self._connect(name, params, stack)
+        except BaseException:
+            await stack.aclose()
+            raise
+        self._server_stacks[name] = stack
         self._servers[name] = handle
         logger.info("ext.mcp_bridge : '%s' prêt — %d tool(s).", name, len(handle.tools))
+
+    async def _restart_server(self, name: str) -> bool:
+        """Relance un serveur statique dont la session est morte. Un seul
+        redémarrage à la fois par serveur ; False si la relance échoue."""
+        if name not in self._servers_cfg:
+            return False
+        lock = self._restart_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            old = self._server_stacks.pop(name, None)
+            self._servers.pop(name, None)
+            if old is not None:
+                try:
+                    await old.aclose()
+                except BaseException as exc:  # flux déjà rompu : fermeture best-effort
+                    logger.debug("ext.mcp_bridge : fermeture de '%s' : %r", name, exc)
+            try:
+                await self._start_server(name, self._servers_cfg[name])
+            except Exception:
+                logger.exception("ext.mcp_bridge : relance de '%s' échouée", name)
+                return False
+        logger.warning("ext.mcp_bridge : '%s' relancé après une coupure", name)
+        return True
+
+    async def _reap_forever(self) -> None:
+        interval = max(30.0, min(self._scoped_idle_seconds / 3, 300.0))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.reap_idle_scoped_servers()
+            except Exception:
+                logger.exception("ext.mcp_bridge : nettoyage des serveurs scopés échoué")
+
+    async def reap_idle_scoped_servers(self, now: float | None = None) -> list[str]:
+        """Ferme les serveurs scopés inutilisés depuis `scoped_idle_seconds`
+        (jamais un serveur en cours d'appel). Réouverts à la demande ensuite."""
+        now = time.monotonic() if now is None else now
+        closed = []
+        for name in list(self._scoped_stacks):
+            if self._in_flight.get(name):
+                continue
+            if now - self._scoped_last_used.get(name, now) < self._scoped_idle_seconds:
+                continue
+            self._servers.pop(name, None)
+            self._scoped_last_used.pop(name, None)
+            stack = self._scoped_stacks.pop(name)
+            try:
+                await stack.aclose()
+            except BaseException as exc:
+                logger.debug("ext.mcp_bridge : fermeture de '%s' : %r", name, exc)
+            closed.append(name)
+        if closed:
+            logger.info("ext.mcp_bridge : %d serveur(s) scopé(s) inactif(s) fermé(s)", len(closed))
+        return closed
 
     @staticmethod
     def server_env(cfg: dict[str, Any]) -> dict[str, str] | None:
@@ -249,6 +330,7 @@ class McpBridgeService(BaseService):
 
         name = self.scoped_server_name(category, key)
         if name in self._servers:
+            self._scoped_last_used[name] = time.monotonic()
             return name
         if category not in self._dynamic_cfg:
             raise ValueError(
@@ -272,6 +354,7 @@ class McpBridgeService(BaseService):
             raise
         self._servers[name] = handle
         self._scoped_stacks[name] = stack
+        self._scoped_last_used[name] = time.monotonic()
         logger.info(
             "ext.mcp_bridge : serveur scopé '%s' prêt (root=%s) — %d tool(s).", name, root, len(handle.tools)
         )
@@ -285,6 +368,7 @@ class McpBridgeService(BaseService):
 
         name = self.scoped_server_name(category, key)
         self._servers.pop(name, None)
+        self._scoped_last_used.pop(name, None)
         stack = self._scoped_stacks.pop(name, None)
         if stack is not None:
             await stack.aclose()
@@ -304,7 +388,14 @@ class McpBridgeService(BaseService):
             await stack.aclose()
 
     async def shutdown(self) -> None:
+        if self._reaper is not None:
+            self._reaper.cancel()
         await self.close_all_scoped_servers()
+        for name in list(self._server_stacks):
+            try:
+                await self._server_stacks.pop(name).aclose()
+            except BaseException as exc:
+                logger.debug("ext.mcp_bridge : fermeture de '%s' : %r", name, exc)
         await self._stack.aclose()
         self._servers.clear()
         self._status = ServiceStatus.STOPPED
@@ -342,18 +433,37 @@ class McpBridgeService(BaseService):
         inconnu ou si le serveur MCP renvoie une erreur (`is_error`) —
         jamais de valeur inventée en silence."""
 
+        self._in_flight[server] = self._in_flight.get(server, 0) + 1
+        try:
+            result = await self._call_once_with_restart(server, tool_name, arguments or {})
+        finally:
+            self._in_flight[server] -= 1
+            if server in self._scoped_last_used:
+                self._scoped_last_used[server] = time.monotonic()
+        if result.is_error:
+            raise RuntimeError(f"ext.mcp_bridge : '{server}.{tool_name}' a renvoyé une erreur : {result.content}")
+        return result.content
+
+    async def _call_once_with_restart(self, server: str, tool_name: str, arguments: dict[str, Any]) -> Any:
+        """Appel borné par le timeout. Si la session d'un serveur STATIQUE est
+        rompue (processus mort, flux fermé), une relance puis un seul nouvel essai."""
         handle = self._server(server)
         try:
-            result = await asyncio.wait_for(
-                handle.session.call_tool(tool_name, arguments or {}), timeout=self._call_timeout
-            )
+            return await asyncio.wait_for(handle.session.call_tool(tool_name, arguments), timeout=self._call_timeout)
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"ext.mcp_bridge : '{server}.{tool_name}' sans réponse après {self._call_timeout:.0f}s."
             ) from exc
-        if result.is_error:
-            raise RuntimeError(f"ext.mcp_bridge : '{server}.{tool_name}' a renvoyé une erreur : {result.content}")
-        return result.content
+        except Exception as exc:
+            if not _is_broken_session(exc) or not await self._restart_server(server):
+                raise
+        handle = self._server(server)
+        try:
+            return await asyncio.wait_for(handle.session.call_tool(tool_name, arguments), timeout=self._call_timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"ext.mcp_bridge : '{server}.{tool_name}' sans réponse après {self._call_timeout:.0f}s."
+            ) from exc
 
     def list_tools_schema(self) -> list[dict[str, Any]]:
         """Schémas OpenAI-format des tools des serveurs STATIQUES
