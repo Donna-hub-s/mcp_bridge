@@ -1,0 +1,8 @@
+# Artefacts Python — ce dépôt est un composant monté comme sous-module : il n'hérite
+# plus du .gitignore du dépôt applicatif, et sans ceci chaque exécution le salit.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
