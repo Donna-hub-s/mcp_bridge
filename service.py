@@ -558,6 +558,19 @@ class McpBridgeService(BaseService):
             if name in declared
         ]
 
+    def sub_agent_routing(self, agent: str) -> dict[str, dict[str, str]]:
+        """Le bloc `routing:` déclaré par chaque sous-agent piloté par `agent` (agents.yaml).
+
+        Transporté tel quel : ce que signifie un « niveau » appartient au plugin chat
+        (app/chat/src/routing.py), pas à ce pont. Consommé par agent_registry.py.
+        """
+        declared = declared_agents()
+        return {
+            name: dict(declared[name].routing)
+            for name in sub_agents_for(agent)
+            if name in declared and declared[name].routing
+        }
+
     def _public_tool_name(self, server: str, tool_name: str) -> str:
         """Nom `mcp_<serveur>_<tool>` conforme aux contraintes providers
         (^[a-zA-Z0-9_-]{1,64}$). Un serveur scopé `category:key` devient
