@@ -1,0 +1,44 @@
+# Identité des sous-agents MCP pilotés par DONNA.
+#
+# CE FICHIER NE DONNE AUCUN DROIT. Les serveurs MCP réellement accessibles à un agent
+# restent décidés par `AGENT_MCP_TOOLS`, en Python, dans catalog.py : ce plafond est la
+# liste blanche, et `tools:` ci-dessous ne peut qu'en choisir un SOUS-ENSEMBLE. Un serveur
+# absent du plafond, ou inconnu, est journalisé et ignoré — jamais accordé.
+#
+# Autrement dit : déclarer un agent est gratuit, lui ouvrir un serveur coûte une revue de
+# code. Un agent déclaré ici sans entrée dans AGENT_MCP_TOOLS existe (il a un nom, une
+# description) mais n'obtient aucun outil — DONNA répondra « sous-agent sans outils ».
+#
+# Pourquoi un fichier ici alors que les agents IPC se déclarent dans leur propre
+# plugin.yaml : un agent IPC EST un plugin, son manifeste est son domicile naturel. Un
+# agent MCP n'est qu'une composition de serveurs, il n'a pas de plugin à lui — d'où ce
+# fichier. L'asymétrie est la forme des deux choses, pas un oubli.
+#
+# Un nom revendiqué deux fois (ici, ou entre ce fichier et un manifeste IPC) écarte TOUS
+# ses porteurs : rien ne dit lequel devrait l'emporter, et déléguer à un agent dont on
+# ignore les outils est pire que ne pas déléguer.
+#
+# Fichier absent ou illisible : repli sur les valeurs Python de catalog.py, et DONNA
+# démarre. Une erreur de syntaxe ici ne doit pas priver l'utilisateur de ses sous-agents.
+
+agents:
+  - name: redacteur
+    description: >-
+      crée et édite des documents Word (courriers, comptes rendus),
+      s'appuie sur les pièces PDF fournies pour leur contenu.
+    # Sous-ensemble du plafond Python. Retirer une ligne retire l'accès ; en ajouter une
+    # hors plafond ne donne rien.
+    tools: [pdf, word, filesystem]
+    routing:
+      # La rédaction demande de la tenue ; elle ne demande pas le modèle le plus cher.
+      default_tier: balanced
+      max_tier: premium
+
+  - name: analyste
+    description: >-
+      lit et analyse des classeurs Excel et des documents PDF (OCR,
+      tableaux, formulaires) pour en extraire et en croiser les données.
+    tools: [pdf, excel, filesystem]
+    routing:
+      default_tier: balanced
+      max_tier: premium

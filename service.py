@@ -98,7 +98,7 @@ from mcp.client.stdio import stdio_client
 from mcp.types import Tool
 
 from xcore.services import BaseService, ServiceStatus
-from .catalog import SUB_AGENT_ROLES, mcp_tools_for_agent, sub_agents_for
+from .catalog import declared_agents, mcp_tools_for_agent, sub_agents_for
 
 logger = logging.getLogger("ext.mcp_bridge")
 
@@ -551,9 +551,11 @@ class McpBridgeService(BaseService):
         `delegate_to_subagent` (les noms et rôles vont en toute lettre
         dans le prompt)."""
 
+        declared = declared_agents()
         return [
-            {"name": role.value, "description": SUB_AGENT_ROLES[role]}
-            for role in sub_agents_for(agent)
+            {"name": name, "description": declared[name].description}
+            for name in sub_agents_for(agent)
+            if name in declared
         ]
 
     def _public_tool_name(self, server: str, tool_name: str) -> str:
